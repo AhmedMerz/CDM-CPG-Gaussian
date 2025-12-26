@@ -1,6 +1,6 @@
 """
 Conditional Diffusion Model for Variogram Parameter Conditioning
-(Zero-Nugget Version)
+(Zero-Nugget Version - NO RECONSTRUCTION LOSS)
 =============================================================
 
 Architecture:
@@ -12,7 +12,7 @@ Key Features:
 1. Sparse conditioning: Wells can be any number, any location
 2. Parameter conditioning: Generates fields respecting input variogram parameters
 3. CPG/CFG: Conditional Parameter Generation / Classifier Free Guidance for both wells and parameters
-4. Reconstruction loss: Ensures generated field honors well observations
+4. NO RECONSTRUCTION LOSS: Model learns conditioning inherently through diffusion process
 5. Resumable Training: Can load last checkpoint and continue training.
 
 Training Data:
@@ -39,7 +39,7 @@ import csv
 import argparse
 
 # Set working directory if needed
-#os.chdir('E:/GAT') 
+os.chdir('E:/GAT') 
 
 
 # =============================================================================
@@ -72,10 +72,6 @@ class Config:
     EMA_DECAY = 0.9999
     GRAD_CLIP = 1.0
     
-    # Loss weights
-    LAMBDA_NOISE = 1.0          # Diffusion loss weight
-    LAMBDA_RECON = 0.1          # Well reconstruction loss weight
-    
     # Well sampling during training
     MIN_WELLS = 50
     MAX_WELLS = 800
@@ -96,7 +92,7 @@ class Config:
     
     # Paths
     DATA_PATH = 'variogram_realizations_FULL25.npy'
-    SAVE_DIR = 'diffusion_checkpointsNONUGGETCOND2'
+    SAVE_DIR = 'diffusion_checkpointsNONUGGETCONDV32_NO_RECON'
     
 config = Config()
 os.makedirs(config.SAVE_DIR, exist_ok=True)
@@ -553,6 +549,7 @@ class ConditionalUNet(nn.Module):
 class ConditionalDiffusion(nn.Module):
     """
     Conditional Diffusion Model for variogram parameter conditioning.
+    NO RECONSTRUCTION LOSS - learns conditioning through diffusion process only.
     """
     def __init__(self, config):
         super().__init__()
@@ -602,7 +599,7 @@ class ConditionalDiffusion(nn.Module):
     
     def p_losses(self, x_start, cond, labels, t=None):
         """
-        Compute training losses.
+        Compute training losses - NOISE PREDICTION ONLY.
         
         Args:
             x_start: Clean images (B, 1, H, W)
@@ -638,35 +635,12 @@ class ConditionalDiffusion(nn.Module):
         # Predict noise
         noise_pred = self.model(x_noisy, t, wells_input, labels, mask_drop_labels)
         
-        # Diffusion loss (predict noise)
+        # Diffusion loss (predict noise) - THIS IS THE ONLY LOSS
         loss_noise = F.mse_loss(noise_pred, noise)
         
-        # Well reconstruction loss (at t=0 equivalent)
-        # For this, we need to estimate x_0 from noise prediction
-        x_0_pred = self.predict_start_from_noise(x_noisy, t, noise_pred)
-        
-        # Extract well mask and values from conditioning
-        well_mask = cond[:, 1:2, :, :]  # (B, 1, H, W)
-        well_values = cond[:, 0:1, :, :]  # (B, 1, H, W)
-        
-        # Reconstruction loss only at well locations and ONLY if wells were NOT dropped
-        recon_sq_diff = (x_0_pred * well_mask - well_values * well_mask) ** 2
-        valid_recon_mask = ~mask_drop_wells_reshaped
-        
-        if valid_recon_mask.any():
-            loss_recon = recon_sq_diff[valid_recon_mask.expand_as(recon_sq_diff)].mean()
-        else:
-            loss_recon = torch.tensor(0.0, device=device)
-        
-        # Total loss
-        total_loss = (self.config.LAMBDA_NOISE * loss_noise + 
-                     self.config.LAMBDA_RECON * loss_recon)
-        
         return {
-            'total': total_loss,
-            'noise': loss_noise,
-            'params': torch.tensor(0.0), # Placeholder
-            'recon': loss_recon
+            'total': loss_noise,
+            'noise': loss_noise
         }
     
     def predict_start_from_noise(self, x_t, t, noise):
@@ -945,7 +919,7 @@ class EMA:
 
 def train(config, resume=True):
     print("="*70)
-    print("CONDITIONAL DIFFUSION MODEL TRAINING (NO NUGGET)")
+    print("CONDITIONAL DIFFUSION MODEL TRAINING (NO NUGGET, NO RECON LOSS)")
     print("="*70)
     
     # Dataset and dataloader
@@ -978,7 +952,7 @@ def train(config, resume=True):
         if checkpoint_path and os.path.exists(checkpoint_path):
             print(f"Resuming from: {checkpoint_path}")
             try:
-                checkpoint = torch.load(checkpoint_path, map_location=config.DEVICE)
+                checkpoint = torch.load('diffusion_checkpointsNONUGGETCONDV32_NO_RECON/checkpoint_epoch200.pth', map_location=config.DEVICE)
                 model.load_state_dict(checkpoint['model_state_dict'])
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -987,19 +961,24 @@ def train(config, resume=True):
                 best_loss = checkpoint.get('loss', float('inf'))
                 print(f"Resuming at Epoch {start_epoch+1}")
             except Exception as e:
-                print(f"Could not resume from checkpoint (structure mismatch likely due to removing nugget?): {e}")
+                print(f"Could not resume from checkpoint: {e}")
                 print("Starting from scratch...")
+        else:
+            # Create new log file header if starting fresh
+            with open(log_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Epoch', 'Total_Loss', 'Noise_Loss', 'LR'])
     else:
         # Create new log file header if starting fresh
         with open(log_file, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['Epoch', 'Total_Loss', 'Noise_Loss', 'Param_Loss', 'Recon_Loss', 'LR'])
+            writer.writerow(['Epoch', 'Total_Loss', 'Noise_Loss', 'LR'])
     # --------------------
 
     # Training loop
     for epoch in range(start_epoch, config.EPOCHS):
         model.train()
-        epoch_losses = {'total': 0, 'noise': 0, 'params': 0, 'recon': 0}
+        epoch_losses = {'total': 0, 'noise': 0}
         
         # Customized Progress Bar
         pbar = tqdm(dataloader, desc=f"Ep {epoch+1}")
@@ -1024,13 +1003,9 @@ def train(config, resume=True):
             for k in epoch_losses:
                 epoch_losses[k] += losses[k].item()
             
-            # Update Progress Bar with abbreviations
-            # N=Noise, P=Params, R=Recon
+            # Update Progress Bar
             pbar.set_postfix({
-                'Tot': f"{losses['total'].item():.3f}",
-                'N': f"{losses['noise'].item():.3f}",
-                'P': f"{losses['params'].item():.3f}",
-                'R': f"{losses['recon'].item():.3f}" 
+                'Loss': f"{losses['total'].item():.4f}"
             })
         
         # Calculate Averages
@@ -1039,14 +1014,14 @@ def train(config, resume=True):
         current_lr = scheduler.get_last_lr()[0]
         
         # Print Clean Summary Table
-        print(f" -----------------------------------------------------------")
-        print(f" | Epoch {epoch+1:03d} | Total: {avg['total']:.4f} | Recon: {avg['recon']:.4f} | LR: {current_lr:.1e} |")
-        print(f" -----------------------------------------------------------")
+        print(f" ------------------------------------------------")
+        print(f" | Epoch {epoch+1:03d} | Loss: {avg['total']:.4f} | LR: {current_lr:.1e} |")
+        print(f" ------------------------------------------------")
         
         # Log to CSV
         with open(log_file, 'a', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow([epoch+1, avg['total'], avg['noise'], avg['params'], avg['recon'], current_lr])
+            writer.writerow([epoch+1, avg['total'], avg['noise'], current_lr])
 
         # Save Checkpoints (Best & Regular)
         if avg['total'] < best_loss:
@@ -1237,13 +1212,13 @@ if __name__ == "__main__":
     
     if args.mode == 'train':
         # Pass the resume flag to the train function
-        model, ema = train(config, resume=args.resume)
+        model, ema = train(config, resume=True)
     
     else:
         # Test inference
         if args.checkpoint is None:
             # Try to find the best model if none specified
-            args.checkpoint = f"{config.SAVE_DIR}/checkpoint_best.pth"
+            args.checkpoint = f"{config.SAVE_DIR}/checkpoint_epoch200.pth"
             if not os.path.exists(args.checkpoint):
                 # Fallback to latest epoch if best doesn't exist
                 args.checkpoint = find_latest_checkpoint(config.SAVE_DIR)
